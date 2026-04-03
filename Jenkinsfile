@@ -1,15 +1,35 @@
 pipeline {
-    agent any
+    // Inline pod: sonar-scanner for analysis, gcloud for Dataproc/GCS operations.
+    // Both containers share the same workspace volume so git checkout is visible to all.
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: sonar-scanner
+    image: sonarsource/sonar-scanner-cli:latest
+    command: [cat]
+    tty: true
+  - name: gcloud
+    image: google/cloud-sdk:slim
+    command: [cat]
+    tty: true
+'''
+            defaultContainer 'gcloud'
+        }
+    }
 
     environment {
-        SONAR_PROJECT_KEY = "mayavi-analysis"
+        SONAR_PROJECT_KEY  = "mayavi-analysis"
         SONAR_PROJECT_NAME = "Mayavi Static Analysis"
-        // These are injected by the Jenkins Helm deployment via containerEnv
-        SONARQUBE_URL      = "${env.SONARQUBE_URL}"
-        DATAPROC_REGION    = "${env.DATAPROC_REGION}"
-        DATAPROC_CLUSTER   = "${env.DATAPROC_CLUSTER_NAME}"
-        GCP_PROJECT        = "${env.GCP_PROJECT_ID}"
-        HADOOP_BUCKET      = "${env.HADOOP_BUCKET}"
+        // Injected via JCasC globalNodeProperties — available on all agent pods
+        SONARQUBE_URL    = "${env.SONARQUBE_URL}"
+        DATAPROC_REGION  = "${env.DATAPROC_REGION}"
+        DATAPROC_CLUSTER = "${env.DATAPROC_CLUSTER_NAME}"
+        GCP_PROJECT      = "${env.GCP_PROJECT_ID}"
+        HADOOP_BUCKET    = "${env.HADOOP_BUCKET}"
     }
 
     stages {
@@ -23,19 +43,24 @@ pipeline {
 
         stage('SonarQube Analysis') {
             steps {
-                withSonarQubeEnv('SonarQube') {
-                    script {
-                        // Jenkins auto-downloads SonarScanner via the tool configuration
-                        def scannerHome = tool name: 'SonarScanner', type: 'hudson.plugins.sonar.SonarRunnerInstallation'
-                        sh """
-                            ${scannerHome}/bin/sonar-scanner \
-                              -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
-                              -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
-                              -Dsonar.sources=. \
-                              -Dsonar.inclusions="**/*.py" \
-                              -Dsonar.python.version=3 \
-                              -Dsonar.host.url=${SONARQUBE_URL}
-                        """
+                container('sonar-scanner') {
+                    withSonarQubeEnv('SonarQube') {
+                        withCredentials([usernamePassword(
+                            credentialsId: 'sonarqube-admin-password',
+                            usernameVariable: 'SONAR_USER',
+                            passwordVariable: 'SONAR_PASS'
+                        )]) {
+                            sh """
+                                sonar-scanner \
+                                  -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                                  -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
+                                  -Dsonar.sources=. \
+                                  -Dsonar.inclusions="**/*.py" \
+                                  -Dsonar.python.version=3 \
+                                  -Dsonar.login=${SONAR_USER} \
+                                  -Dsonar.password=${SONAR_PASS}
+                            """
+                        }
                     }
                 }
             }
@@ -63,7 +88,6 @@ pipeline {
             steps {
                 echo "Uploading repository files to GCS for Hadoop input..."
                 sh """
-                    # Upload all Python files from the repo to GCS input directory
                     gsutil -m rsync -r -x '.*\\.git.*' . gs://${HADOOP_BUCKET}/input/
 
                     echo "Files uploaded to gs://${HADOOP_BUCKET}/input/"
@@ -85,6 +109,7 @@ pipeline {
                         --project=${GCP_PROJECT} \
                         --jar=file:///usr/lib/hadoop/hadoop-streaming.jar \
                         -- \
+                        -D mapreduce.input.fileinputformat.input.dir.recursive=true \
                         -files gs://${HADOOP_BUCKET}/jobs/mapper.py,gs://${HADOOP_BUCKET}/jobs/reducer.py \
                         -mapper  "python3 mapper.py" \
                         -reducer "python3 reducer.py" \
